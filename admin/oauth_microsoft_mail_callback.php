@@ -49,7 +49,7 @@ if (defined('BASE_URL') && !empty(BASE_URL)) {
 
 $redirect_uri = $base_url . '/admin/oauth_microsoft_mail_callback.php';
 $token_url = 'https://login.microsoftonline.com/' . rawurlencode($config_mail_oauth_tenant_id) . '/oauth2/v2.0/token';
-$scope = 'offline_access openid profile https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
+$scope = 'offline_access openid profile https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send';
 
 $ch = curl_init($token_url);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
