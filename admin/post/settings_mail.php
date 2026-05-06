@@ -57,7 +57,7 @@ if (isset($_POST['oauth_connect_microsoft_mail'])) {
     $_SESSION['mail_oauth_state'] = $state;
     $_SESSION['mail_oauth_state_expires_at'] = time() + 600;
 
-    $scope = 'offline_access openid profile https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
+    $scope = 'offline_access openid profile https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send';
 
     $authorize_url = MICROSOFT_OAUTH_BASE_URL . rawurlencode($config_mail_oauth_tenant_id) . '/oauth2/v2.0/authorize?'
         . http_build_query([
