@@ -516,6 +516,7 @@ if ($imap_provider === '') {
 /** ------------------------------------------------------------------
  * Webklex IMAP setup (supports Standard / Google OAuth / Microsoft OAuth)
  * ------------------------------------------------------------------ */
+use Webklex\PHPIMAP\ClientManager;
 
 $validate_cert = true;
 
@@ -558,241 +559,117 @@ if ($imap_provider === 'google_oauth') {
     }
 }
 
-/** ------------------------------------------------------------------
- * Raw socket IMAP client (replaces Webklex)
- * ------------------------------------------------------------------ */
+$cm = new ClientManager();
 
-function imap_cmd($socket, string $tag, string $cmd): array {
-    fwrite($socket, "$tag $cmd\r\n");
-    $lines = [];
-    while (!feof($socket)) {
-        $buf = fgets($socket, 4096);
-        if ($buf === false) break;
-        $lines[] = rtrim($buf, "\r\n");
-        if (preg_match("/^$tag (OK|NO|BAD)/i", $buf)) break;
-    }
-    return $lines;
-}
+$client = $cm->make(array_filter([
+    'host'           => $host,
+    'port'           => $port,
+    'encryption'     => $encr,            // 'ssl' | 'tls' | null
+    'validate_cert'  => (bool)$validate_cert,
+    'username'       => $user,            // full mailbox address (OAuth uses user as principal)
+    'password'       => $pass,            // access token when $auth === 'oauth'
+    'authentication' => $auth,            // 'oauth' or null
+    'protocol'       => 'imap',
+]));
 
-function imap_read_literal($socket, int $bytes): string {
-    $data = '';
-    $remaining = $bytes;
-    while ($remaining > 0 && !feof($socket)) {
-        $chunk = fread($socket, min($remaining, 8192));
-        if ($chunk === false) break;
-        $data .= $chunk;
-        $remaining -= strlen($chunk);
-    }
-    return $data;
-}
-
-function imap_read_fetch($socket, string $tag): string {
-    $raw = '';
-    while (!feof($socket)) {
-        $buf = fgets($socket, 4096);
-        if ($buf === false) break;
-        if (preg_match('/\{(\d+)\}$/', rtrim($buf, "\r\n"), $m)) {
-            $raw .= $buf;
-            $raw .= imap_read_literal($socket, (int)$m[1]);
-            continue;
-        }
-        $raw .= $buf;
-        if (preg_match("/^$tag (OK|NO|BAD)/i", $buf)) break;
-    }
-    return $raw;
-}
-
-// Open SSL socket
-$errno = 0;
-$errstr = '';
-$socket = stream_socket_client(
-    "ssl://{$host}:{$port}",
-    $errno,
-    $errstr,
-    30,
-    STREAM_CLIENT_CONNECT,
-    stream_context_create(['ssl' => [
-        'verify_peer'      => (bool)$validate_cert,
-        'verify_peer_name' => (bool)$validate_cert,
-    ]])
-);
-
-if (!$socket) {
-    logApp("Cron-Email-Parser", "error", "IMAP socket connect failed: $errstr ($errno)");
+try {
+    $client->connect();
+} catch (\Throwable $e) {
+    echo "Error connecting to IMAP server: " . $e->getMessage();
     @unlink($lock_file_path);
     exit(1);
 }
 
-stream_set_timeout($socket, 30);
+$inbox = $client->getFolderByPath('INBOX');
 
-// Read server greeting
-fgets($socket, 4096);
-
-// Authenticate
-if ($auth === 'oauth') {
-    $xoauth2 = base64_encode("user={$user}\x01auth=Bearer {$pass}\x01\x01");
-    $resp = imap_cmd($socket, 'A001', "AUTHENTICATE XOAUTH2 {$xoauth2}");
-} else {
-    $user_esc = addcslashes($user, '"\\');
-    $pass_esc = addcslashes($pass, '"\\');
-    $resp = imap_cmd($socket, 'A001', "LOGIN \"{$user_esc}\" \"{$pass_esc}\"");
+$targetFolderPath = 'ITFlow';
+try {
+    $targetFolder = $client->getFolderByPath($targetFolderPath);
+} catch (\Throwable $e) {
+    $client->createFolder($targetFolderPath);
+    $targetFolder = $client->getFolderByPath($targetFolderPath);
 }
 
-if (!preg_match('/A001 OK/i', implode(' ', $resp))) {
-    logApp("Cron-Email-Parser", "error", "IMAP authentication failed: " . implode(' ', $resp));
-    fclose($socket);
-    @unlink($lock_file_path);
-    exit(1);
-}
-
-// Ensure ITFlow folder exists
-$list_resp = imap_cmd($socket, 'A002', 'LIST "" "ITFlow"');
-if (!preg_match('/\* LIST/i', implode(' ', $list_resp))) {
-    imap_cmd($socket, 'A003', 'CREATE "ITFlow"');
-}
-
-// Select INBOX
-$select_resp = imap_cmd($socket, 'A004', 'SELECT INBOX');
-if (!preg_match('/A004 OK/i', implode(' ', $select_resp))) {
-    logApp("Cron-Email-Parser", "error", "IMAP SELECT INBOX failed: " . implode(' ', $select_resp));
-    fclose($socket);
-    @unlink($lock_file_path);
-    exit(1);
-}
-
-// Search for unseen messages
-$search_resp = imap_cmd($socket, 'A005', 'SEARCH UNSEEN');
-$uids = [];
-foreach ($search_resp as $line) {
-    if (preg_match('/^\* SEARCH(.*)$/i', $line, $m)) {
-        $ids = trim($m[1]);
-        if (!empty($ids)) {
-            $uids = array_values(array_filter(array_map('intval', explode(' ', $ids))));
-        }
-    }
-}
+// Fetch unseen messages
+$messages = $inbox->messages()->leaveUnread()->unseen()->get();
 
 // Counters
 $processed_count = 0;
 $unprocessed_count = 0;
 
-// Fetch and process each message
-$tag_counter = 6;
-foreach ($uids as $uid) {
-    $fetch_tag = 'A' . str_pad((string)$tag_counter++, 3, '0', STR_PAD_LEFT);
-    fwrite($socket, "$fetch_tag FETCH $uid (BODY.PEEK[])\r\n");
-    $raw = imap_read_fetch($socket, $fetch_tag);
-
+// Process messages
+foreach ($messages as $message) {
     $email_processed = false;
 
-    // Save original message as .eml
+    // Save original message as .eml (getRawMessage() doesn't seem to work properly)
     mkdirMissing('../uploads/tmp/');
     $original_message_file = "processed-eml-" . randomString(200) . ".eml";
-    file_put_contents("../uploads/tmp/{$original_message_file}", $raw);
-
-    // Parse with mailparse
-    $mime = mailparse_msg_create();
-    mailparse_msg_parse($mime, $raw);
-    $structure = mailparse_msg_get_structure($mime);
-
-    // Get headers from root
-    $root_data = mailparse_msg_get_part_data(mailparse_msg_get_part($mime, $structure[0]));
-    $headers = $root_data['headers'] ?? [];
+    $raw_message = (string)$message->getHeader()->raw . "\r\n\r\n" . ($message->getRawBody() ?? $message->getHTMLBody() ?? $message->getTextBody());
+    file_put_contents("../uploads/tmp/{$original_message_file}", $raw_message);
 
     // From
-    $from_raw = $headers['from'] ?? '';
-    if (preg_match('/^(.*?)\s*<([^>]+)>/', $from_raw, $fm)) {
-        $from_name  = sanitizeInput(trim($fm[1], ' "\''));
-        $from_email = sanitizeInput(trim($fm[2]));
-    } else {
-        $from_email = sanitizeInput(trim($from_raw));
-        $from_name  = $from_email;
-    }
-    if (empty($from_email)) $from_email = 'itflow-guest@example.com';
-    if (empty($from_name))  $from_name  = 'Unknown';
+    $from_col    = $message->getFrom();
+    $from_first  = ($from_col && $from_col->count()) ? $from_col->first() : null;
+    $from_email = sanitizeInput($from_first->mail ?? 'itflow-guest@example.com');
+    $from_name  = sanitizeInput($from_first->personal ?? 'Unknown');
 
-    $from_parts = explode('@', $from_email);
-    $from_domain = sanitizeInput(end($from_parts));
+    $from_domain = explode("@", $from_email);
+    $from_domain = sanitizeInput(end($from_domain));
 
     // Subject
-    $subject_raw = $headers['subject'] ?? 'No Subject';
-    $subject = sanitizeInput(iconv_mime_decode($subject_raw, ICONV_MIME_DECODE_CONTINUE_ON_ERROR, 'UTF-8') ?: $subject_raw);
+    $subject = sanitizeInput((string)$message->getSubject() ?: 'No Subject');
 
     // CC
-    $ccs = [];
-    $cc_raw = $headers['cc'] ?? '';
-    if (!empty($cc_raw)) {
-        preg_match_all('/[\w.+-]+@[\w.-]+\.[a-z]{2,}/i', $cc_raw, $cc_matches);
-        $ccs = $cc_matches[0] ?? [];
-    }
-
-    // Date
-    $date_raw = $headers['date'] ?? '';
-    $ts   = $date_raw ? strtotime($date_raw) : false;
-    $date = sanitizeInput($ts !== false ? date('Y-m-d H:i:s', $ts) : date('Y-m-d H:i:s'));
-
-    // Body + attachments
-    $message_body_html = '';
-    $message_body_text = '';
-    $attachments = [];
-
-    foreach ($structure as $part_id) {
-        $part      = mailparse_msg_get_part($mime, $part_id);
-        $part_data = mailparse_msg_get_part_data($part);
-        $ctype     = strtolower(explode(';', $part_data['content-type'] ?? 'text/plain')[0]);
-        $dispo     = strtolower($part_data['content-disposition'] ?? '');
-        $encoding  = strtolower($part_data['transfer-encoding'] ?? '');
-        $cid       = trim($part_data['content-id'] ?? '', '<>');
-
-        $start = $part_data['starting-pos-body'] ?? 0;
-        $end   = $part_data['ending-pos-body']   ?? 0;
-        $body  = substr($raw, $start, $end - $start);
-
-        if ($encoding === 'base64') {
-            $body = base64_decode($body);
-        } elseif ($encoding === 'quoted-printable') {
-            $body = quoted_printable_decode($body);
-        }
-
-        $charset = 'UTF-8';
-        if (preg_match('/charset=["\']?([^"\';\s]+)/i', $part_data['content-type'] ?? '', $cm)) {
-            $charset = strtoupper(trim($cm[1]));
-        }
-
-        if ($ctype === 'text/html' && $dispo !== 'attachment') {
-            if ($charset !== 'UTF-8') {
-                $body = @iconv($charset, 'UTF-8//IGNORE', $body) ?: $body;
-            }
-            $message_body_html = $body;
-        } elseif ($ctype === 'text/plain' && $dispo !== 'attachment' && empty($message_body_html)) {
-            if ($charset !== 'UTF-8') {
-                $body = @iconv($charset, 'UTF-8//IGNORE', $body) ?: $body;
-            }
-            $message_body_text = $body;
-        } elseif (!empty($body) && $part_id !== $structure[0]) {
-            $att_name  = $part_data['disposition-filename']
-                      ?? $part_data['content-name']
-                      ?? ($cid ? "inline_$cid" : 'attachment');
-            $is_inline = ($dispo === 'inline' && !empty($cid));
-
-            if ($is_inline && !empty($message_body_html)) {
-                $mime_type = explode(';', $part_data['content-type'] ?? 'application/octet-stream')[0];
-                $data_uri  = "data:$mime_type;base64," . base64_encode($body);
-                $message_body_html = str_replace("cid:$cid", $data_uri, $message_body_html);
-            } else {
-                $attachments[] = ['name' => $att_name, 'content' => $body];
-            }
+    $ccs = array();
+    $cc_attr = $message->header->cc;
+    $cc_list = $cc_attr->toArray();
+    foreach ($cc_list as $cc_addr) {
+        if ($cc_addr instanceof \Webklex\PHPIMAP\Address) {
+            $ccs[] = $cc_addr->mail;
         }
     }
 
-    mailparse_msg_free($mime);
+    // Date (string)
+    $dateAttr = $message->getDate();                  // Attribute
+    $dateRaw  = $dateAttr ? (string)$dateAttr : '';   // e.g. "Tue, 10 Sep 2025 13:22:05 +0000"
+    $ts       = $dateRaw ? strtotime($dateRaw) : false;
+    $date     = sanitizeInput($ts !== false ? date('Y-m-d H:i:s', $ts) : date('Y-m-d H:i:s'));
+
+    // Body (prefer HTML)
+    $message_body_html = $message->getHTMLBody();
+    $message_body_text = $message->getTextBody();
+    $message_body_raw  = $message->getRawBody();
 
     if (!empty($message_body_html)) {
         $message_body = $message_body_html;
     } elseif (!empty($message_body_text)) {
         $message_body = nl2br(htmlspecialchars($message_body_text));
     } else {
-        $message_body = '';
+        // Final fallback
+        $message_body = nl2br(htmlspecialchars($message_body_raw));
+    }
+
+    // Handle attachments (inline vs regular)
+    $attachments = [];
+    foreach ($message->getAttachments() as $att) {
+        $attrs   = $att->getAttributes(); // v6.2: canonical source
+        $dispo   = strtolower((string)($attrs['disposition'] ?? ''));
+        $cid     = $attrs['id'] ?? null;            // Content-ID
+        $content = $attrs['content'] ?? null;       // binary
+        $mime    = $att->getMimeType();
+        $name    = $att->getName() ?: 'attachment';
+
+        $is_inline = false;
+        if ($dispo === 'inline' && $cid && $content !== null) {
+            $cid_trim  = trim($cid, '<>');
+            $dataUri   = "data:$mime;base64,".base64_encode($content);
+            $message_body = str_replace(["cid:$cid_trim", "cid:$cid"], $dataUri, $message_body);
+            $is_inline = true;
+        }
+
+        if (!$is_inline && $content !== null) {
+            $attachments[] = ['name' => $name, 'content' => $content];
+        }
     }
 
     // 1. Reply to existing ticket with the number in subject
@@ -993,32 +870,47 @@ foreach ($uids as $uid) {
 
     // Flag/move based on processing result
     if ($email_processed) {
-        $processed_count++;
-        $t = 'B' . str_pad((string)$tag_counter++, 3, '0', STR_PAD_LEFT);
-        imap_cmd($socket, $t, "STORE $uid +FLAGS (\\Seen)");
-        $t = 'B' . str_pad((string)$tag_counter++, 3, '0', STR_PAD_LEFT);
-        imap_cmd($socket, $t, "COPY $uid \"ITFlow\"");
-        $t = 'B' . str_pad((string)$tag_counter++, 3, '0', STR_PAD_LEFT);
-        imap_cmd($socket, $t, "STORE $uid +FLAGS (\\Deleted)");
+        $processed_count++; // increment first so a move failure doesn't hide the success
+        try {
+            $message->setFlag('Seen');
+            // Move using the Folder object (top-level "ITFlow")
+            $message->move($targetFolderPath);
+            // optional: logApp("Cron-Email-Parser", "info", "Moved message to ITFlow");
+        } catch (\Throwable $e) {
+            // >>> Put the extra logging RIGHT HERE
+            $subj = (string)$message->getSubject();
+            $uid  = method_exists($message, 'getUid') ? $message->getUid() : 'n/a';
+            $path = (is_object($targetFolder) && property_exists($targetFolder, 'path')) ? (string)$targetFolder->path : $targetFolderPath;
+            logApp(
+                "Cron-Email-Parser",
+                "warning",
+                "Move failed (subject=\"$subj\", uid=$uid) to [$path]: ".$e->getMessage()
+            );
+        }
     } else {
         $unprocessed_count++;
-        $t = 'B' . str_pad((string)$tag_counter++, 3, '0', STR_PAD_LEFT);
-        imap_cmd($socket, $t, "STORE $uid +FLAGS (\\Flagged)");
+        try {
+            $message->setFlag('Flagged');
+            $message->unsetFlag('Seen');
+        } catch (\Throwable $e) {
+            logApp("Cron-Email-Parser", "warning", "Flag update failed: ".$e->getMessage());
+        }
     }
 
-    // Cleanup temp .eml
+    // Cleanup temp .eml if still present (e.g., reply path)
     if (isset($original_message_file)) {
         $tmp_path = "../uploads/tmp/{$original_message_file}";
         if (file_exists($tmp_path)) { @unlink($tmp_path); }
     }
 }
 
-// Expunge and close
-$t = 'Z' . str_pad((string)$tag_counter++, 3, '0', STR_PAD_LEFT);
-imap_cmd($socket, $t, 'EXPUNGE');
-$t = 'Z' . str_pad((string)$tag_counter++, 3, '0', STR_PAD_LEFT);
-imap_cmd($socket, $t, 'LOGOUT');
-fclose($socket);
+// Expunge & disconnect
+try {
+    $client->expunge();
+} catch (\Throwable $e) {
+    // ignore
+}
+$client->disconnect();
 
 // Execution timing (optional)
 $script_end_time = microtime(true);
