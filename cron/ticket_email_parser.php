@@ -645,7 +645,7 @@ foreach ($messages as $message) {
         $cid         = $att->contentId();
         $content     = $att->contents();
         $mime        = $att->contentType();
-        $is_inline   = !empty($cid) && str_contains(($att->disposition() ?? ''), 'inline');
+        $is_inline   = !empty($cid);
 
         if ($is_inline && !empty($message_body_html) && $content !== null) {
             $cid_trim        = trim($cid, '<>');
