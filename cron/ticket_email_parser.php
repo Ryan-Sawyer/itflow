@@ -592,6 +592,7 @@ $messages = $mailbox->inbox()
     ->unseen()
     ->withHeaders()
     ->withBody()
+    ->limit(50)
     ->get();
 
 // Counters
