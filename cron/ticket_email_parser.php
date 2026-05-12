@@ -1,7 +1,7 @@
 <?php
 /*
- * CRON - Email Parser (Webklex PHP-IMAP)
- * Process emails and create/update tickets using Webklex\PHPIMAP instead of native IMAP
+ * CRON - Email Parser (IMAPengine-IMAP)
+ * Process emails and create/update tickets using DirectoryTree\ImapEngine instead of native IMAP
  */
 
 // Start the timer
@@ -15,7 +15,7 @@ if (php_sapi_name() !== 'cli') {
     die("This script must be run from the command line.\n");
 }
 
-// Autoload (Webklex & any composer deps)
+// Autoload (ImapEngine & any composer deps)
 require_once "../plugins/vendor/autoload.php";
 
 // Get ITFlow config & helper functions
@@ -514,9 +514,8 @@ if ($imap_provider === '') {
 }
 
 /** ------------------------------------------------------------------
- * Webklex IMAP setup (supports Standard / Google OAuth / Microsoft OAuth)
+ * IMAPengine IMAP setup (supports Standard / Google OAuth / Microsoft OAuth)
  * ------------------------------------------------------------------ */
-use Webklex\PHPIMAP\ClientManager;
 
 $validate_cert = true;
 
@@ -559,39 +558,41 @@ if ($imap_provider === 'google_oauth') {
     }
 }
 
-$cm = new ClientManager();
+use DirectoryTree\ImapEngine\Mailbox;
 
-$client = $cm->make(array_filter([
+$mailbox = new Mailbox([
     'host'           => $host,
     'port'           => $port,
-    'encryption'     => $encr,            // 'ssl' | 'tls' | null
+    'encryption'     => $encr ?: null,
     'validate_cert'  => (bool)$validate_cert,
-    'username'       => $user,            // full mailbox address (OAuth uses user as principal)
-    'password'       => $pass,            // access token when $auth === 'oauth'
-    'authentication' => $auth,            // 'oauth' or null
-    'protocol'       => 'imap',
-]));
+    'username'       => $user,
+    'password'       => $pass,
+    'authentication' => $auth ?? 'plain',
+]);
 
 try {
-    $client->connect();
+    $mailbox->connect();
 } catch (\Throwable $e) {
-    echo "Error connecting to IMAP server: " . $e->getMessage();
+    logApp("Cron-Email-Parser", "error", "IMAP connection failed: " . $e->getMessage());
     @unlink($lock_file_path);
     exit(1);
 }
 
-$inbox = $client->getFolderByPath('INBOX');
-
+// Ensure ITFlow folder exists
 $targetFolderPath = 'ITFlow';
 try {
-    $targetFolder = $client->getFolderByPath($targetFolderPath);
+    $mailbox->folders()->find($targetFolderPath);
 } catch (\Throwable $e) {
-    $client->createFolder($targetFolderPath);
-    $targetFolder = $client->getFolderByPath($targetFolderPath);
+    $mailbox->folders()->create($targetFolderPath);
 }
 
 // Fetch unseen messages
-$messages = $inbox->messages()->leaveUnread()->unseen()->get();
+$messages = $mailbox->inbox()
+    ->messages()
+    ->unseen()
+    ->withHeaders()
+    ->withBody()
+    ->get();
 
 // Counters
 $processed_count = 0;
@@ -601,75 +602,65 @@ $unprocessed_count = 0;
 foreach ($messages as $message) {
     $email_processed = false;
 
-    // Save original message as .eml (getRawMessage() doesn't seem to work properly)
+    // Save original message as .eml
     mkdirMissing('../uploads/tmp/');
     $original_message_file = "processed-eml-" . randomString(200) . ".eml";
-    $raw_message = (string)$message->getHeader()->raw . "\r\n\r\n" . ($message->getRawBody() ?? $message->getHTMLBody() ?? $message->getTextBody());
+    $raw_message = ($message->head() ?? '') . "\r\n\r\n" . ($message->body() ?? '');
     file_put_contents("../uploads/tmp/{$original_message_file}", $raw_message);
 
     // From
-    $from_col    = $message->getFrom();
-    $from_first  = ($from_col && $from_col->count()) ? $from_col->first() : null;
-    $from_email = sanitizeInput($from_first->mail ?? 'itflow-guest@example.com');
-    $from_name  = sanitizeInput($from_first->personal ?? 'Unknown');
+    $from_addr  = $message->from(fetch: true);
+    $from_email = sanitizeInput($from_addr?->email() ?? 'itflow-guest@example.com');
+    $from_name  = sanitizeInput($from_addr?->name()  ?? 'Unknown');
 
-    $from_domain = explode("@", $from_email);
-    $from_domain = sanitizeInput(end($from_domain));
+    $from_parts  = explode('@', $from_email);
+    $from_domain = sanitizeInput(end($from_parts));
 
     // Subject
-    $subject = sanitizeInput((string)$message->getSubject() ?: 'No Subject');
+    $subject = sanitizeInput($message->subject(fetch: true) ?: 'No Subject');
 
     // CC
-    $ccs = array();
-    $cc_attr = $message->header->cc;
-    $cc_list = $cc_attr->toArray();
-    foreach ($cc_list as $cc_addr) {
-        if ($cc_addr instanceof \Webklex\PHPIMAP\Address) {
-            $ccs[] = $cc_addr->mail;
+    $ccs = [];
+    foreach ($message->cc(fetch: true) as $cc_addr) {
+        if (!empty($cc_addr->email())) {
+            $ccs[] = $cc_addr->email();
         }
     }
 
-    // Date (string)
-    $dateAttr = $message->getDate();                  // Attribute
-    $dateRaw  = $dateAttr ? (string)$dateAttr : '';   // e.g. "Tue, 10 Sep 2025 13:22:05 +0000"
-    $ts       = $dateRaw ? strtotime($dateRaw) : false;
-    $date     = sanitizeInput($ts !== false ? date('Y-m-d H:i:s', $ts) : date('Y-m-d H:i:s'));
+    // Date
+    $date_carbon = $message->date(fetch: true);
+    $date = $date_carbon
+        ? sanitizeInput($date_carbon->format('Y-m-d H:i:s'))
+        : sanitizeInput(date('Y-m-d H:i:s'));
 
-    // Body (prefer HTML)
-    $message_body_html = $message->getHTMLBody();
-    $message_body_text = $message->getTextBody();
-    $message_body_raw  = $message->getRawBody();
+    // Body
+    $message_body_html = $message->html() ?? '';
+    $message_body_text = $message->text() ?? '';
+
+    // Attachments
+    $attachments = [];
+    foreach ($message->attachments(fetch: true) as $att) {
+        $att_name    = $att->filename() ?? 'attachment';
+        $cid         = $att->contentId();
+        $content     = $att->contents();
+        $mime        = $att->contentType();
+        $is_inline   = !empty($cid) && str_contains(($att->disposition() ?? ''), 'inline');
+
+        if ($is_inline && !empty($message_body_html) && $content !== null) {
+            $cid_trim        = trim($cid, '<>');
+            $data_uri        = "data:$mime;base64," . base64_encode($content);
+            $message_body_html = str_replace(["cid:$cid_trim", "cid:$cid"], $data_uri, $message_body_html);
+        } elseif ($content !== null) {
+            $attachments[] = ['name' => $att_name, 'content' => $content];
+        }
+    }
 
     if (!empty($message_body_html)) {
         $message_body = $message_body_html;
     } elseif (!empty($message_body_text)) {
         $message_body = nl2br(htmlspecialchars($message_body_text));
     } else {
-        // Final fallback
-        $message_body = nl2br(htmlspecialchars($message_body_raw));
-    }
-
-    // Handle attachments (inline vs regular)
-    $attachments = [];
-    foreach ($message->getAttachments() as $att) {
-        $attrs   = $att->getAttributes(); // v6.2: canonical source
-        $dispo   = strtolower((string)($attrs['disposition'] ?? ''));
-        $cid     = $attrs['id'] ?? null;            // Content-ID
-        $content = $attrs['content'] ?? null;       // binary
-        $mime    = $att->getMimeType();
-        $name    = $att->getName() ?: 'attachment';
-
-        $is_inline = false;
-        if ($dispo === 'inline' && $cid && $content !== null) {
-            $cid_trim  = trim($cid, '<>');
-            $dataUri   = "data:$mime;base64,".base64_encode($content);
-            $message_body = str_replace(["cid:$cid_trim", "cid:$cid"], $dataUri, $message_body);
-            $is_inline = true;
-        }
-
-        if (!$is_inline && $content !== null) {
-            $attachments[] = ['name' => $name, 'content' => $content];
-        }
+        $message_body = '';
     }
 
     // 1. Reply to existing ticket with the number in subject
@@ -782,7 +773,7 @@ foreach ($messages as $message) {
             $original_subject  = null;
             $original_to       = null;
 
-            // Webklex stores DSN info in attachments, not parts
+            // DSN info is stored in attachments, not parts
             foreach ($message->getAttachments() as $attachment) {
 
                 $ctype = strtolower($attachment->getContentType());
@@ -867,50 +858,34 @@ foreach ($messages as $message) {
         }
     }
 
-
-    // Flag/move based on processing result
+// Flag/move based on processing result
     if ($email_processed) {
-        $processed_count++; // increment first so a move failure doesn't hide the success
+        $processed_count++;
         try {
-            $message->setFlag('Seen');
-            // Move using the Folder object (top-level "ITFlow")
+            $message->markSeen();
             $message->move($targetFolderPath);
-            // optional: logApp("Cron-Email-Parser", "info", "Moved message to ITFlow");
         } catch (\Throwable $e) {
-            // >>> Put the extra logging RIGHT HERE
-            $subj = (string)$message->getSubject();
-            $uid  = method_exists($message, 'getUid') ? $message->getUid() : 'n/a';
-            $path = (is_object($targetFolder) && property_exists($targetFolder, 'path')) ? (string)$targetFolder->path : $targetFolderPath;
-            logApp(
-                "Cron-Email-Parser",
-                "warning",
-                "Move failed (subject=\"$subj\", uid=$uid) to [$path]: ".$e->getMessage()
-            );
+            logApp("Cron-Email-Parser", "warning", "Move failed: " . $e->getMessage());
         }
     } else {
         $unprocessed_count++;
         try {
-            $message->setFlag('Flagged');
-            $message->unsetFlag('Seen');
+            $message->markFlagged();
+            $message->unmarkSeen();
         } catch (\Throwable $e) {
-            logApp("Cron-Email-Parser", "warning", "Flag update failed: ".$e->getMessage());
+            logApp("Cron-Email-Parser", "warning", "Flag update failed: " . $e->getMessage());
         }
     }
 
-    // Cleanup temp .eml if still present (e.g., reply path)
+    // Cleanup temp .eml
     if (isset($original_message_file)) {
         $tmp_path = "../uploads/tmp/{$original_message_file}";
         if (file_exists($tmp_path)) { @unlink($tmp_path); }
     }
 }
 
-// Expunge & disconnect
-try {
-    $client->expunge();
-} catch (\Throwable $e) {
-    // ignore
-}
-$client->disconnect();
+// Disconnect
+$mailbox->disconnect();
 
 // Execution timing (optional)
 $script_end_time = microtime(true);
